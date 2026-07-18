@@ -1,0 +1,40 @@
+# Виртуальное окружение
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Файлы с паролями и секретами
+.env
+*.env
+*.env.local
+*.env.production
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Системные
+.DS_Store
+Thumbs.db
+
+# Railway / деплой
+railway/
+*.pid
