@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
-load_dotenv()
+#load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qarmaq")
