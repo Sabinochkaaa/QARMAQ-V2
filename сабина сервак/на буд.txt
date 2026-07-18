@@ -1,0 +1,6 @@
+py -m pip install -r bibl.txt
+
+py main.py 
+ngrok http 8000
+
+python -m pip install fastapi uvicorn asyncpg pydantic python-dotenv библ питона
