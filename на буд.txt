@@ -4,3 +4,4 @@ py main.py
 ngrok http 8000
 
 python -m pip install fastapi uvicorn asyncpg pydantic python-dotenv библ питона
+pip install cryptography
