@@ -3,4 +3,4 @@ uvicorn
 asyncpg
 python-dotenv
 pydantic
-
+cryptography
