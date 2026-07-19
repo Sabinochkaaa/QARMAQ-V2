@@ -6,15 +6,47 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import asyncpg
+import json as _json
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
+from cryptography.fernet import Fernet
 
 #load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qarmaq")
+
+# ─── ШИФРОВАНИЕ ──────────────────────────────────────────────────────
+# Ключ в .env: ENCRYPT_KEY=...
+# Если не задан — генерируется и печатается при старте (скопируй в .env!)
+_RAW_KEY = os.environ.get("ENCRYPT_KEY", "")
+if not _RAW_KEY:
+    _RAW_KEY = Fernet.generate_key().decode()
+    print("=" * 60)
+    print("ENCRYPT_KEY не задан в .env!")
+    print(f"   Добавь: ENCRYPT_KEY={_RAW_KEY}")
+    print("=" * 60)
+
+_fernet = Fernet(_RAW_KEY.encode() if isinstance(_RAW_KEY, str) else _RAW_KEY)
+
+
+def encrypt(value: Optional[str]) -> Optional[str]:
+    """Шифрует строку перед записью в БД."""
+    if value is None:
+        return None
+    return _fernet.encrypt(value.encode()).decode()
+
+
+def decrypt(value: Optional[str]) -> Optional[str]:
+    """Расшифровывает строку при чтении из БД."""
+    if value is None:
+        return None
+    try:
+        return _fernet.decrypt(value.encode()).decode()
+    except Exception:
+        return "[расшифровка невозможна]"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -95,40 +127,24 @@ def utcnow() -> datetime:
 
 pool: Optional[asyncpg.Pool] = None
 
-
 MIGRATION_SQL = """
--- КАНАЛЫ
 create table if not exists channels (
-    id         bigserial primary key,
-    name       text not null,
-    tg_id      bigint not null unique,
-    username   text,
-    first_seen timestamptz default now(),
-    last_seen  timestamptz default now()
+    id bigserial primary key, name text not null, tg_id bigint not null unique,
+    username text, first_seen timestamptz default now(), last_seen timestamptz default now()
 );
 create index if not exists idx_channels_tg_id on channels (tg_id);
 create index if not exists idx_channels_name  on channels (name);
 
--- ПОСТЫ
 create table if not exists posts (
-    id              bigserial primary key,
-    channel_id      bigint not null references channels(id) on delete cascade,
-    message_id      bigint not null,
-    message_link    text,
-    message_date    timestamptz,
-    sender_id       bigint,
-    sender_type     text,
-    raw_text        text,
-    normalized_text text,
-    category        text not null,
-    category_raw    text,
-    risk_score      real default 0.0,
-    explanation     text,
-    prefilter_hints text[],
-    analyzed_at     timestamptz default now(),
-    model           text,
-    is_suspicious   boolean generated always as (category <> 'CLEAN' and risk_score >= 0.5) stored,
-    created_at      timestamptz default now(),
+    id bigserial primary key,
+    channel_id bigint not null references channels(id) on delete cascade,
+    message_id bigint not null, message_link text, message_date timestamptz,
+    sender_id bigint, sender_type text, raw_text text, normalized_text text,
+    category text not null, category_raw text, risk_score real default 0.0,
+    explanation text, prefilter_hints text[], analyzed_at timestamptz default now(),
+    model text,
+    is_suspicious boolean generated always as (category <> 'CLEAN' and risk_score >= 0.5) stored,
+    created_at timestamptz default now(),
     unique (channel_id, message_id)
 );
 create index if not exists idx_posts_channel       on posts (channel_id);
@@ -138,138 +154,130 @@ create index if not exists idx_posts_is_suspicious on posts (is_suspicious) wher
 create index if not exists idx_posts_sender_id     on posts (sender_id);
 create index if not exists idx_posts_message_date  on posts (message_date desc);
 
--- КРАСНЫЕ ФЛАГИ
 create table if not exists red_flags (
-    id        bigserial primary key,
-    post_id   bigint not null references posts(id) on delete cascade,
+    id bigserial primary key,
+    post_id bigint not null references posts(id) on delete cascade,
     flag_text text not null
 );
 create index if not exists idx_red_flags_post on red_flags (post_id);
 
--- СВЯЗИ МЕЖДУ КАНАЛАМИ
 create table if not exists channel_links (
-    id                bigserial primary key,
+    id bigserial primary key,
     source_channel_id bigint not null references channels(id) on delete cascade,
-    source_post_id    bigint references posts(id) on delete set null,
-    target            text not null,
-    link_type         text not null,
-    discovered_url    text,
-    button_text       text,
-    found_at          timestamptz default now()
+    source_post_id bigint references posts(id) on delete set null,
+    target text not null, link_type text not null,
+    discovered_url text, button_text text, found_at timestamptz default now()
 );
 create unique index if not exists idx_channel_links_unique_with_post
-    on channel_links (source_channel_id, source_post_id, target)
-    where source_post_id is not null;
+    on channel_links (source_channel_id, source_post_id, target) where source_post_id is not null;
 create unique index if not exists idx_channel_links_unique_no_post
-    on channel_links (source_channel_id, target)
-    where source_post_id is null;
+    on channel_links (source_channel_id, target) where source_post_id is null;
 create index if not exists idx_channel_links_source on channel_links (source_channel_id);
 create index if not exists idx_channel_links_target on channel_links (target);
 create index if not exists idx_channel_links_type   on channel_links (link_type);
 
--- КРИПТОКОШЕЛЬКИ
 create table if not exists crypto_wallets (
-    id               bigserial primary key,
-    address          text not null unique,
-    chain            text,
-    first_seen       timestamptz default now(),
-    last_seen        timestamptz default now(),
-    tx_count         int,
-    total_volume_usd numeric(20, 2),
-    risk_label       text
+    id bigserial primary key, address text not null unique, chain text,
+    first_seen timestamptz default now(), last_seen timestamptz default now(),
+    tx_count int, total_volume_usd numeric(20,2), risk_label text
 );
 create index if not exists idx_wallets_address on crypto_wallets (address);
 create index if not exists idx_wallets_chain   on crypto_wallets (chain);
 
--- УПОМИНАНИЯ КОШЕЛЬКОВ В ПОСТАХ
 create table if not exists wallet_mentions (
-    id        bigserial primary key,
+    id bigserial primary key,
     wallet_id bigint not null references crypto_wallets(id) on delete cascade,
-    post_id   bigint not null references posts(id) on delete cascade,
-    found_at  timestamptz default now(),
+    post_id bigint not null references posts(id) on delete cascade,
+    found_at timestamptz default now(),
     unique (wallet_id, post_id)
 );
 create index if not exists idx_wallet_mentions_wallet on wallet_mentions (wallet_id);
 create index if not exists idx_wallet_mentions_post   on wallet_mentions (post_id);
 
--- СТАТЬИ УК/КоАП РК
 create table if not exists legal_articles (
-    id             bigserial primary key,
-    code           text not null,
-    article_number text not null,
-    title          text not null,
-    description    text,
-    categories     text[] not null,
-    max_penalty    text,
-    adilet_url     text,
-    created_at     timestamptz default now(),
+    id bigserial primary key, code text not null, article_number text not null,
+    title text not null, description text, categories text[] not null,
+    max_penalty text, adilet_url text, created_at timestamptz default now(),
     unique (code, article_number)
 );
 create index if not exists idx_legal_articles_categories on legal_articles using gin (categories);
 
--- ПРИВЯЗКА ПОСТОВ К СТАТЬЯМ
 create table if not exists post_articles (
-    id         bigserial primary key,
-    post_id    bigint not null references posts(id) on delete cascade,
+    id bigserial primary key,
+    post_id bigint not null references posts(id) on delete cascade,
     article_id bigint not null references legal_articles(id) on delete cascade,
     unique (post_id, article_id)
 );
 create index if not exists idx_post_articles_post    on post_articles (post_id);
 create index if not exists idx_post_articles_article on post_articles (article_id);
 
--- АЛЕРТЫ
 create table if not exists alerts (
-    id         bigserial primary key,
+    id bigserial primary key,
     channel_id bigint references channels(id) on delete cascade,
-    post_id    bigint references posts(id) on delete set null,
-    wallet_id  bigint references crypto_wallets(id) on delete set null,
-    alert_type text not null,
-    message    text,
-    risk_score real,
-    is_read    boolean default false,
-    created_at timestamptz default now()
+    post_id bigint references posts(id) on delete set null,
+    wallet_id bigint references crypto_wallets(id) on delete set null,
+    alert_type text not null, message text, risk_score real,
+    is_read boolean default false, created_at timestamptz default now()
 );
 create index if not exists idx_alerts_channel on alerts (channel_id);
 create index if not exists idx_alerts_is_read on alerts (is_read) where is_read = false;
 create index if not exists idx_alerts_created on alerts (created_at desc);
 
--- ФОРУМНЫЕ ПОСТЫ (даркнет)
 create table if not exists forum_posts (
-    id         bigserial primary key,
-    forum_name text,
-    title      text,
-    author     text,
-    post_text  text,
-    url        text,
-    intent     text,
-    category   text,
-    parsed_at  timestamptz default now()
+    id bigserial primary key, forum_name text, title text, author text,
+    post_text text, url text, intent text, category text,
+    parsed_at timestamptz default now()
 );
 create index if not exists idx_forum_posts_category on forum_posts (category);
 create index if not exists idx_forum_posts_author   on forum_posts (author);
 
--- БОТ: состояния
 create table if not exists bot_states (
-    chat_id         bigint primary key,
-    username        text,
-    state           int default 0,
-    last_message    text,
-    last_message_at timestamptz default now(),
-    updated_at      timestamptz default now()
+    chat_id bigint primary key, username text, state int default 0,
+    last_message text, last_message_at timestamptz default now(),
+    updated_at timestamptz default now()
 );
 create index if not exists idx_bot_states_updated on bot_states (updated_at desc);
 
--- БОТ: история сообщений
 create table if not exists bot_messages (
-    id           bigserial primary key,
-    chat_id      bigint not null references bot_states(chat_id) on delete cascade,
-    username     text,
-    message_text text,
-    is_from_user boolean default true,
-    created_at   timestamptz default now()
+    id bigserial primary key,
+    chat_id bigint not null references bot_states(chat_id) on delete cascade,
+    username text, message_text text, is_from_user boolean default true,
+    created_at timestamptz default now()
 );
 create index if not exists idx_bot_messages_chat    on bot_messages (chat_id);
 create index if not exists idx_bot_messages_created on bot_messages (created_at desc);
+
+-- ДОСЬЕ НА ПОДОЗРЕВАЕМЫХ (чувствительные поля зашифрованы на сервере)
+create table if not exists suspects (
+    id              bigserial primary key,
+    name_enc        text,           -- имя зашифровано
+    username_enc    text,           -- @username зашифровано
+    card_enc        text,           -- номер карты зашифровано
+    wallet_enc      text,           -- крипто-адрес зашифровано
+    iin_enc         text,           -- ИИН зашифровано
+    source          text,           -- 'telegram' | 'forum' | 'darknet' | 'other'
+    source_url      text,
+    evidence_text   text,
+    screenshot_url  text,
+    has_screenshot  boolean default false,
+    channel_id      bigint references channels(id) on delete set null,
+    post_id         bigint references posts(id) on delete set null,
+    wallet_id       bigint references crypto_wallets(id) on delete set null,
+    legal_article   text,
+    category        text,
+    risk_level      text default 'MEDIUM',
+    status          text default 'active',
+    notes           text,
+    reviewed_by     text,
+    reviewed_at     timestamptz,
+    created_at      timestamptz default now(),
+    updated_at      timestamptz default now()
+);
+create index if not exists idx_suspects_status   on suspects (status);
+create index if not exists idx_suspects_category on suspects (category);
+create index if not exists idx_suspects_risk     on suspects (risk_level);
+create index if not exists idx_suspects_channel  on suspects (channel_id);
+create index if not exists idx_suspects_created  on suspects (created_at desc);
 
 -- VIEWS
 create or replace view channel_graph as
@@ -282,14 +290,12 @@ join channels c on c.id = cl.source_channel_id
 left join posts p on p.id = cl.source_post_id;
 
 create or replace view mentions_summary as
-select target, link_type,
-       count(*) as total_mentions,
+select target, link_type, count(*) as total_mentions,
        count(distinct source_channel_id) as mentioned_by_count,
        array_agg(distinct c.name) as mentioned_by_channels
 from channel_links cl
 join channels c on c.id = cl.source_channel_id
-group by target, link_type
-order by total_mentions desc;
+group by target, link_type order by total_mentions desc;
 
 create or replace view wallet_dossier as
 select cw.id as wallet_id, cw.address, cw.chain, cw.first_seen, cw.last_seen,
@@ -305,7 +311,7 @@ left join posts p on p.id = wm.post_id
 left join channels ch on ch.id = p.channel_id
 group by cw.id;
 
--- НАЧАЛЬНЫЕ ДАННЫЕ: статьи УК/КоАП РК
+-- СТАТЬИ УК/КоАП
 insert into legal_articles (code, article_number, title, description, categories, max_penalty, adilet_url) values
 ('УК','297','Незаконный оборот наркотических средств','Незаконные изготовление, переработка, приобретение, хранение, перевозка или сбыт наркотических средств.',ARRAY['DRUG'],'до 15 лет лишения свободы (ч.3)','https://adilet.zan.kz/rus/docs/K1400000226#z2883'),
 ('УК','298','Склонение к потреблению наркотических средств','Склонение к потреблению наркотических средств, психотропных веществ или их аналогов.',ARRAY['DRUG'],'до 7 лет лишения свободы','https://adilet.zan.kz/rus/docs/K1400000226#z2897'),
@@ -322,7 +328,6 @@ on conflict (code, article_number) do nothing;
 
 
 async def run_migrations(pool):
-    """Создаёт все таблицы при старте сервера если их нет."""
     async with pool.acquire() as conn:
         await conn.execute(MIGRATION_SQL)
     logger.info("✅ Миграции выполнены — все таблицы готовы")
@@ -1257,214 +1262,223 @@ async def export_for_arujan(
             })
 
         return {"count": len(results), "reports": results}
-"""
 
-Как работает:
-- Аружан парсит YouTube / форум / сайт / что угодно
-- Шлёт на POST /ingest/source с полем source_type="youtube"
-- Сервер сам создаёт таблицу source_youtube если её нет
-- Записывает данные туда
-"""
 
-# ─── ДИНАМИЧЕСКИЕ ИСТОЧНИКИ ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# ДОСЬЕ НА ПОДОЗРЕВАЕМЫХ — с шифрованием чувствительных полей
+# Чувствительные данные (имя, карта, кошелёк, ИИН) шифруются
+# перед записью в БД. При чтении расшифровываются автоматически.
+# ═══════════════════════════════════════════════════════════════
 
-class SourceEvent(BaseModel):
+class SuspectCreate(BaseModel):
+    # Чувствительные поля — будут зашифрованы
+    name:       Optional[str] = None
+    username:   Optional[str] = None
+    card:       Optional[str] = None
+    wallet:     Optional[str] = None
+    iin:        Optional[str] = None
+    # Открытые поля
+    source:         str = "telegram"
+    source_url:     Optional[str] = None
+    evidence_text:  Optional[str] = None
+    screenshot_url: Optional[str] = None
+    # Связи с основными таблицами
+    channel_id:     Optional[int] = None
+    post_id:        Optional[int] = None
+    wallet_id:      Optional[int] = None
+    # Правовая привязка
+    legal_article:  Optional[str] = None
+    category:       Optional[str] = None
+    risk_level:     str = "MEDIUM"
+    notes:          Optional[str] = None
+    reviewed_by:    Optional[str] = None
+
+
+class SuspectUpdate(BaseModel):
+    status:        Optional[str] = None
+    notes:         Optional[str] = None
+    risk_level:    Optional[str] = None
+    reviewed_by:   Optional[str] = None
+    legal_article: Optional[str] = None
+
+
+def _decrypt_row(row: dict) -> dict:
+    """Расшифровывает чувствительные поля перед отправкой клиенту."""
+    d = dict(row)
+    d["name"]     = decrypt(d.pop("name_enc", None))
+    d["username"] = decrypt(d.pop("username_enc", None))
+    d["card"]     = decrypt(d.pop("card_enc", None))
+    d["wallet"]   = decrypt(d.pop("wallet_enc", None))
+    d["iin"]      = decrypt(d.pop("iin_enc", None))
+    return d
+
+
+@app.post("/suspects")
+async def create_suspect(s: SuspectCreate, request: Request):
     """
-    Универсальный формат для любого источника.
-    Аружан шлёт source_type = 'youtube' / 'forum' / 'website' / что угодно.
-    """
-    source_type: str           # 'youtube' | 'forum' | 'website' | 'vk' | ...
-    source_name: str           # название канала / сайта / форума
-    source_url:  Optional[str] = None
-
-    # данные поста/видео/темы
-    item_id:     Optional[str] = None   # ID видео, ID поста и тд
-    title:       Optional[str] = None
-    author:      Optional[str] = None
-    text:        Optional[str] = None
-    item_url:    Optional[str] = None
-    published_at: Optional[str] = None
-
-    # результат анализа (если Аружан уже прогнала через LLM)
-    category:    Optional[str] = None
-    risk_score:  float = 0.0
-    explanation: Optional[str] = None
-
-    # любые доп поля — сохраняем как JSON
-    extra:       Optional[dict] = None
-
-
-def _safe_table_name(source_type: str) -> str:
-    """
-    'YouTube' → 'source_youtube'
-    'my forum!' → 'source_my_forum'
-    Только буквы, цифры, подчёркивание — безопасно для SQL.
-    """
-    import re
-    clean = re.sub(r'[^a-zA-Z0-9]', '_', source_type.lower())
-    clean = re.sub(r'_+', '_', clean).strip('_')
-    return f"source_{clean}"
-
-
-async def ensure_source_table(conn, table_name: str):
-    """Создаёт таблицу для источника если её ещё нет."""
-    await conn.execute(f"""
-        create table if not exists {table_name} (
-            id           bigserial primary key,
-            source_name  text,                        -- название канала/сайта
-            source_url   text,                        -- ссылка на источник
-            item_id      text,                        -- ID видео / поста
-            title        text,                        -- заголовок
-            author       text,                        -- автор
-            text         text,                        -- текст / описание
-            item_url     text,                        -- прямая ссылка
-            published_at timestamptz,                 -- дата публикации
-            category     text,                        -- DRUG / DROP / PYRAMID / ...
-            risk_score   real default 0.0,
-            explanation  text,                        -- почему подозрительно
-            extra        jsonb,                       -- любые доп данные
-            parsed_at    timestamptz default now(),
-
-            -- не дублируем одно и то же видео/пост
-            unique (source_name, item_id)
-        );
-        create index if not exists idx_{table_name}_category
-            on {table_name} (category);
-        create index if not exists idx_{table_name}_risk
-            on {table_name} (risk_score desc);
-        create index if not exists idx_{table_name}_author
-            on {table_name} (author);
-    """)
-
-
-@app.post("/ingest/source")
-async def ingest_source(ev: SourceEvent, request: Request):
-    """
-    Принимает данные с любого источника.
-    Таблица создаётся автоматически при первой отправке.
-
-    Пример от Аружан для YouTube:
-    {
-        "source_type": "youtube",
-        "source_name": "NarkoDiler2025",
-        "source_url": "https://youtube.com/channel/xxx",
-        "item_id": "dQw4w9WgXcQ",
-        "title": "Доставка по всему Казахстану",
-        "author": "NarkoDiler2025",
-        "text": "Пишите в телеграм @dealer_kz...",
-        "item_url": "https://youtube.com/watch?v=dQw4w9WgXcQ",
-        "published_at": "2025-06-01T12:00:00",
-        "category": "DRUG",
-        "risk_score": 0.95,
-        "explanation": "Явная реклама наркотиков"
-    }
+    Создаёт запись о подозреваемом.
+    Поля name, username, card, wallet, iin — шифруются автоматически.
+    Требует X-Ingest-Token.
     """
     check_token(request)
-
-    table_name = _safe_table_name(ev.source_type)
-
-    import json
-
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # 1. Создаём таблицу если нет
-            await ensure_source_table(conn, table_name)
-
-            # 2. Вставляем данные
-            row_id = await conn.fetchval(f"""
-                insert into {table_name}
-                    (source_name, source_url, item_id, title, author,
-                     text, item_url, published_at, category, risk_score,
-                     explanation, extra)
-                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                on conflict (source_name, item_id) do update
-                    set risk_score  = excluded.risk_score,
-                        category    = excluded.category,
-                        explanation = excluded.explanation
-                returning id
-                """,
-                ev.source_name, ev.source_url, ev.item_id or "unknown",
-                ev.title, ev.author, ev.text, ev.item_url,
-                parse_dt(ev.published_at),
-                normalize_category(ev.category) if ev.category else None,
-                ev.risk_score, ev.explanation,
-                json.dumps(ev.extra) if ev.extra else None,
-            )
-
-            # 3. Алерт если подозрительно
-            if ev.risk_score >= 0.5 and ev.category and ev.category.upper() != "CLEAN":
-                await conn.execute("""
-                    insert into alerts (alert_type, message, risk_score)
-                    values ($1, $2, $3)
-                    """,
-                    f"new_{ev.source_type}_post",
-                    f"[{ev.source_type.upper()}] {ev.source_name}: {ev.title or ev.text or ''}",
-                    ev.risk_score,
+            # Если передан wallet-адрес — добавляем в crypto_wallets
+            w_id = s.wallet_id
+            if s.wallet and not w_id:
+                w_id = await conn.fetchval(
+                    """insert into crypto_wallets (address, chain, last_seen)
+                    values ($1, $2, now())
+                    on conflict (address) do update set last_seen=now()
+                    returning id""",
+                    s.wallet, detect_chain(s.wallet),
                 )
+            row_id = await conn.fetchval(
+                """insert into suspects
+                    (name_enc, username_enc, card_enc, wallet_enc, iin_enc,
+                     source, source_url, evidence_text, screenshot_url, has_screenshot,
+                     channel_id, post_id, wallet_id,
+                     legal_article, category, risk_level, notes, reviewed_by, reviewed_at)
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,now())
+                returning id""",
+                encrypt(s.name), encrypt(s.username), encrypt(s.card),
+                encrypt(s.wallet), encrypt(s.iin),
+                s.source, s.source_url, s.evidence_text, s.screenshot_url,
+                bool(s.screenshot_url),
+                s.channel_id, s.post_id, w_id,
+                s.legal_article,
+                normalize_category(s.category) if s.category else None,
+                s.risk_level, s.notes, s.reviewed_by,
+            )
+            if s.risk_level == "HIGH":
+                await conn.execute(
+                    """insert into alerts (channel_id, post_id, alert_type, message, risk_score)
+                    values ($1,$2,'new_suspect_high_risk',$3,1.0)""",
+                    s.channel_id, s.post_id,
+                    f"Новый подозреваемый HIGH RISK · {s.source} · {s.legal_article or '—'}",
+                )
+    return {"status": "created", "id": row_id}
 
+
+@app.get("/suspects")
+async def list_suspects(
+    request: Request,
+    status:     Optional[str] = None,
+    category:   Optional[str] = None,
+    risk_level: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Список досье — данные расшифровываются автоматически. Требует токен."""
+    check_token(request)
+    filters, params, idx = [], [], 1
+    if status:
+        filters.append(f"s.status=${idx}"); params.append(status); idx+=1
+    if category:
+        filters.append(f"s.category=${idx}"); params.append(category.upper()); idx+=1
+    if risk_level:
+        filters.append(f"s.risk_level=${idx}"); params.append(risk_level.upper()); idx+=1
+    where = ("where " + " and ".join(filters)) if filters else ""
+    params += [limit, offset]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""select s.*, c.name as channel_name, c.tg_id as channel_tg_id
+            from suspects s left join channels c on c.id=s.channel_id
+            {where} order by s.created_at desc limit ${idx} offset ${idx+1}""",
+            *params,
+        )
+        total = await conn.fetchval(
+            f"select count(*) from suspects s {where}", *params[:-2]
+        )
+    return {"total": total, "suspects": [_decrypt_row(dict(r)) for r in rows]}
+
+
+@app.get("/suspects/stats")
+async def suspects_stats(request: Request):
+    """Сводка по досье для дашборда."""
+    check_token(request)
+    async with pool.acquire() as conn:
+        total     = await conn.fetchval("select count(*) from suspects")
+        by_status = await conn.fetch("select status, count(*) as cnt from suspects group by status")
+        by_risk   = await conn.fetch("select risk_level, count(*) as cnt from suspects group by risk_level")
+        by_cat    = await conn.fetch(
+            "select category, count(*) as cnt from suspects where category is not null group by category order by cnt desc"
+        )
+        recent_high = await conn.fetch(
+            "select id, source, legal_article, category, risk_level, created_at "
+            "from suspects where risk_level='HIGH' order by created_at desc limit 5"
+        )
     return {
-        "status":     "success",
-        "table":      table_name,
-        "row_id":     row_id,
-        "source_type": ev.source_type,
+        "total":           total,
+        "by_status":       {r["status"]: r["cnt"] for r in by_status},
+        "by_risk":         {r["risk_level"]: r["cnt"] for r in by_risk},
+        "by_category":     {r["category"]: r["cnt"] for r in by_cat},
+        "recent_high_risk": [dict(r) for r in recent_high],
     }
 
 
-@app.get("/sources")
-async def list_sources():
-    """Список всех динамических источников (таблиц source_*)."""
+@app.get("/suspects/{suspect_id}")
+async def get_suspect(suspect_id: int, request: Request):
+    """Полное досье на подозреваемого — расшифровано + применимые статьи."""
+    check_token(request)
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            select table_name,
-                   pg_size_pretty(pg_total_relation_size(quote_ident(table_name))) as size
-            from information_schema.tables
-            where table_schema = 'public'
-              and table_name like 'source_%'
-            order by table_name
-        """)
-        result = []
-        for r in rows:
-            tname = r["table_name"]
-            count = await conn.fetchval(f"select count(*) from {tname}")
-            result.append({
-                "table":  tname,
-                "source": tname.replace("source_", ""),
-                "rows":   count,
-                "size":   r["size"],
-            })
-        return result
+        row = await conn.fetchrow(
+            """select s.*, c.name as channel_name, c.tg_id as channel_tg_id,
+                   p.raw_text as post_text, p.category as post_category, p.risk_score,
+                   cw.address as wallet_address, cw.chain as wallet_chain
+            from suspects s
+            left join channels c on c.id=s.channel_id
+            left join posts p on p.id=s.post_id
+            left join crypto_wallets cw on cw.id=s.wallet_id
+            where s.id=$1""",
+            suspect_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Досье не найдено")
+        result = _decrypt_row(dict(row))
+        if result.get("category"):
+            articles = await conn.fetch(
+                "select code, article_number, title, max_penalty, adilet_url "
+                "from legal_articles where $1=any(categories)",
+                result["category"],
+            )
+            result["applicable_articles"] = [dict(a) for a in articles]
+    return result
 
 
-@app.get("/sources/{source_type}")
-async def get_source_data(
-    source_type: str,
-    limit: int = 50,
-    category: Optional[str] = None,
-):
-    """Данные из конкретного источника. source_type = 'youtube', 'forum' и тд."""
-    table_name = _safe_table_name(source_type)
+@app.patch("/suspects/{suspect_id}")
+async def update_suspect(suspect_id: int, upd: SuspectUpdate, request: Request):
+    """Обновляет статус/заметки. Зашифрованные данные не меняются."""
+    check_token(request)
     async with pool.acquire() as conn:
-        # проверяем что таблица существует
-        exists = await conn.fetchval("""
-            select exists (
-                select 1 from information_schema.tables
-                where table_schema='public' and table_name=$1
-            )
-        """, table_name)
-        if not exists:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Источник '{source_type}' ещё не добавлен"
-            )
+        sets, params, idx = [], [], 1
+        for field, val in upd.model_dump(exclude_none=True).items():
+            sets.append(f"{field}=${idx}"); params.append(val); idx+=1
+        if not sets:
+            raise HTTPException(status_code=400, detail="Нет полей для обновления")
+        sets.append("updated_at=now()")
+        params.append(suspect_id)
+        updated = await conn.fetchrow(
+            f"update suspects set {', '.join(sets)} where id=${idx} returning id, status",
+            *params,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Досье не найдено")
+    return {"status": "updated", "id": updated["id"], "new_status": updated["status"]}
 
-        where = f"where category = '{category.upper()}'" if category else ""
-        rows = await conn.fetch(f"""
-            select * from {table_name}
-            {where}
-            order by risk_score desc, parsed_at desc
-            limit $1
-        """, limit)
-        return [dict(r) for r in rows]
+
+@app.delete("/suspects/{suspect_id}")
+async def delete_suspect(suspect_id: int, request: Request):
+    """Удаляет досье. Необратимо."""
+    check_token(request)
+    async with pool.acquire() as conn:
+        deleted = await conn.fetchval(
+            "delete from suspects where id=$1 returning id", suspect_id
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Досье не найдено")
+    return {"status": "deleted", "id": deleted}
+
 
 # ─── ЗАПУСК ─────────────────────────────────────────────────────────
 
@@ -1495,7 +1509,12 @@ if __name__ == "__main__":
     print("  /legal/by-category/{cat}     — статьи по категории")
     print("  /export/arujan     — выгрузка JSON для Аружан")
     print()
+    print("  ДОСЬЕ (suspects):")
+    print("  /suspects          — список досье")
+    print("  /suspects/{id}     — полное досье с расшифровкой")
+    print("  /suspects/stats    — сводка по досье")
+    print()
     print("  ОБНОВЛЕНИЕ (PATCH):")
-    print("  /wallet/{address}/blockchain — данные от Расула (блокчейн)")
+    print("  /wallet/{address}/blockchain — данны (блокчейн)")
     print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=8000)
